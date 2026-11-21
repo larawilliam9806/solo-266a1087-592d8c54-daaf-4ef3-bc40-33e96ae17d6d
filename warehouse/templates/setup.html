@@ -16,6 +16,16 @@
     <input type="month" name="month" required autofocus>
     <small>例如 2026-10。清运月不能晚于待封月。</small>
   </label>
+  <label class="field checkbox-field">
+    <span class="check-line">
+      <input type="checkbox" name="takeover" value="1" id="takeover-choice">
+      <label for="takeover-choice">从旧仓接账（期初接收旧仓已结地磅单的最新修订）</label>
+    </span>
+    <small>
+      勾选后仍可照常收单，但首月须等接账成功才能封存；随后在台账页一次交齐
+      旧仓清册（沿用原 CSV 格式，每个单号一行，清运月须早于首个待封月）。
+    </small>
+  </label>
   <button class="btn primary" type="submit">开始建账</button>
 </form>
 
@@ -26,6 +36,8 @@
     <li>旧版重传、原样重传都沿用当前值；提交当前版本却改了内容，整批退回。</li>
     <li>已封月收到补单记净重，收到更正先冲回旧街道、再补记订正后的街道。</li>
     <li>上传与封存按提交生效的先后归月，失败时原单据与底表保持不变。</li>
+    <li>选择从旧仓接账时：两仓同号单清运月不符、或同修订号内容不符，整份清册退回；
+        接账后同号单取修订号较高的一份，旧仓已结净重不会再计一次。</li>
   </ul>
 </section>
 {% endblock %}

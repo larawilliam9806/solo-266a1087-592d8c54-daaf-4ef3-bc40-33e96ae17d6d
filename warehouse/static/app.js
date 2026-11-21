@@ -60,6 +60,96 @@
     box.appendChild(el("p", "muted", "整批退回，未写入任何数据，原单据与底表保持不变。"));
   }
 
+  function renderTakeoverResult(box, data) {
+    box.hidden = false;
+    box.textContent = "";
+    box.className = "result " + (data.ok ? "ok" : "bad");
+
+    if (data.ok) {
+      var s = data.summary || {};
+      box.appendChild(el("h3", null, "旧仓接账成功，首月 " + data.first_pending_month + " 底表已生效"));
+      box.appendChild(
+        el(
+          "p",
+          null,
+          "清册共 " + s.rows + " 行：清册独有 " + s.register_only +
+            "，清册修订胜出 " + s.register_won +
+            "，新仓修订胜出 " + s.new_won + "。"
+        )
+      );
+      box.appendChild(el("p", "muted", "现在可以封存首月，页面即将刷新…"));
+      window.setTimeout(function () {
+        window.location.href =
+          "/?month=" + encodeURIComponent(data.first_pending_month);
+      }, 1200);
+      return;
+    }
+
+    box.appendChild(el("h3", null, data.error || "接账清册未通过核对"));
+    var details = data.details || [];
+    if (details.length) {
+      var list = el("ul");
+      details.forEach(function (item) {
+        var text = "第 " + item.line + " 行";
+        if (item.ticket_no) text += "（" + item.ticket_no + "）";
+        text += "：" + item.message;
+        list.appendChild(el("li", null, text));
+      });
+      box.appendChild(list);
+    }
+    if (data.details_truncated) {
+      box.appendChild(
+        el("p", "muted", "仅显示前 " + details.length + " 条，共 " + data.detail_count + " 条。")
+      );
+    }
+    box.appendChild(el("p", "muted", "整份清册退回，未写入任何数据；已入账的普通批次与底表保持不变，可修正后重交。"));
+  }
+
+  var takeoverForm = document.getElementById("takeover-form");
+  if (takeoverForm) {
+    takeoverForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var box = document.getElementById("takeover-result");
+      var button = takeoverForm.querySelector('button[type="submit"]');
+      var fileInput = takeoverForm.querySelector('input[type="file"]');
+      if (!fileInput.files.length) {
+        renderTakeoverResult(box, { ok: false, error: "请选择要上传的接账清册 CSV 文件" });
+        return;
+      }
+      var body = new FormData();
+      body.append("file", fileInput.files[0]);
+
+      button.disabled = true;
+      button.textContent = "核对中…";
+
+      fetch("/api/takeover", {
+        method: "POST",
+        body: body,
+        headers: { "X-CSRF-Token": csrfToken(), "Accept": "application/json" },
+      })
+        .then(function (response) {
+          return response.json().then(function (data) {
+            if (!response.ok) {
+              data.ok = false;
+              if (!data.error) data.error = "提交失败（HTTP " + response.status + "）";
+            }
+            return data;
+          });
+        })
+        .catch(function () {
+          return { ok: false, error: "网络中断，未确认本次接账是否生效，请刷新后核对状态" };
+        })
+        .then(function (data) {
+          button.disabled = false;
+          button.textContent = "提交接账清册并核对";
+          renderTakeoverResult(box, data);
+          if (data.ok) {
+            fileInput.value = "";
+          }
+        });
+    });
+  }
+
   var form = document.getElementById("upload-form");
   if (form) {
     form.addEventListener("submit", function (event) {

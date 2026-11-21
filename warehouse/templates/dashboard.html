@@ -1,5 +1,70 @@
 {% extends "base.html" %}
 {% block content %}
+{% if state.takeover.mode and state.takeover.status == 'pending' %}
+<section class="panel takeover-panel">
+  <div class="panel-head">
+    <div>
+      <h1>旧仓接账 · 待提交清册</h1>
+      <p class="sub">
+        建账时选择了从旧仓接账。普通批次仍可照常入账；首月
+        <b>{{ state.takeover.first_pending_month }}</b> 须等接账成功后才能封存。
+      </p>
+    </div>
+    <span class="pill warn">接账状态：待接</span>
+  </div>
+  <form id="takeover-form" class="upload" enctype="multipart/form-data">
+    <label class="field">
+      <span>旧仓已结单清册 CSV</span>
+      <input type="file" name="file" accept=".csv,text/csv" required>
+      <small>
+        沿用原有 CSV 格式（单号、清运月、街道、净重（千克）、修订号），一次交齐旧仓
+        已结单的最新修订；每个单号只填一行，清运月须早于首个待封月
+        {{ state.takeover.first_pending_month }}。
+        <a href="{{ url_for('template') }}">下载模板</a>
+      </small>
+    </label>
+    <div class="upload-target">
+      接账规则
+      <small>
+        两仓同号单清运月不符、或同一修订号内容不符，会列出冲突单号并整份退回；
+        接账后同号单取修订号较高的一份，旧仓已结净重不会重复计入。
+      </small>
+    </div>
+    <button class="btn primary" type="submit">提交接账清册并核对</button>
+  </form>
+  <div id="takeover-result" class="result" hidden></div>
+</section>
+{% elif state.takeover.mode and state.takeover.status == 'done' %}
+<section class="panel takeover-panel done">
+  <div class="panel-head">
+    <div>
+      <h1>旧仓接账 · 已完成</h1>
+      <p class="sub">
+        接账状态、有效单据与首月
+        {{ state.takeover.first_pending_month }} 底表已同时生效；期初只接一次。
+      </p>
+    </div>
+    <span class="pill ok">接账状态：已接</span>
+  </div>
+  {% with t = state.takeover.submission %}
+  {% if t %}
+  <ul class="batch-list">
+    <li>
+      <span class="batch-id">#{{ t.id }}</span>
+      <span class="batch-file" title="{{ t.filename }}">{{ t.filename }}</span>
+      <span class="muted">清册 {{ t.row_count }} 行</span>
+      <span>清册独有 {{ t.register_only_count }} · 清册胜出 {{ t.register_won_count }} · 新仓胜出 {{ t.new_won_count }}</span>
+      <span class="muted">{{ t.submitted_at|time }}</span>
+    </li>
+  </ul>
+  {% endif %}
+  {% endwith %}
+  <p class="empty small">
+    清册外的单据照常计入；后续更正从接账后的有效版本起算。
+  </p>
+</section>
+{% endif %}
+
 <section class="grid">
   <div class="panel tall">
     <div class="panel-head">
@@ -15,7 +80,14 @@
       </div>
       <div class="panel-actions">
         {% if view.status == "pending" %}
+          {% if state.takeover.mode and state.takeover.status == 'pending' and view.month == state.first_pending_month %}
+          <button class="btn primary" type="button" disabled title="首月须等旧仓接账成功后才能封存">
+            封存 {{ view.month }}（待接账）
+          </button>
+          <p class="empty small seal-hint">首月须等接账成功才能封存，普通批次可照常收单。</p>
+          {% else %}
           <button class="btn primary" type="button" data-seal="{{ view.month }}">封存 {{ view.month }}</button>
+          {% endif %}
         {% else %}
           <a class="btn" href="{{ url_for('download', month=view.month) }}">下载原表 CSV</a>
           <form method="post" action="{{ url_for('seal') }}" class="inline">

@@ -22,7 +22,13 @@
           <button class="btn ghost" type="submit">重封（返回原表）</button>
         </form>
       {% elif view.month == current_month %}
+        {% if state.takeover.mode and state.takeover.status == 'pending' and view.month == state.first_pending_month %}
+        <button class="btn primary" type="button" disabled title="首月须等旧仓接账成功后才能封存">
+          封存 {{ view.month }}（待接账）
+        </button>
+        {% else %}
         <button class="btn primary" type="button" data-seal="{{ view.month }}">封存 {{ view.month }}</button>
+        {% endif %}
         <a class="btn" href="{{ url_for('dashboard') }}">返回上传</a>
       {% endif %}
     </div>

@@ -19,6 +19,13 @@
     {% if state.initialized %}
     <nav class="topnav">
       <span class="pill">当前待封月 <b>{{ state.current_pending_month }}</b></span>
+      {% if state.takeover.mode %}
+        {% if state.takeover.status == 'pending' %}
+        <span class="pill warn">旧仓接账 · <b>待接</b>（首月封存前须完成）</span>
+        {% else %}
+        <span class="pill ok">旧仓接账 · <b>已接</b></span>
+        {% endif %}
+      {% endif %}
       {% if state.sealed_months %}
       <span class="pill muted">已封 {{ state.sealed_months|length }} 个月</span>
       {% endif %}

@@ -77,6 +77,20 @@ body {
 }
 .pill b { color: var(--ink); font-variant-numeric: tabular-nums; }
 .pill.muted { opacity: .8; }
+.pill.warn { border-color: #e0b56a; background: #fbf3e2; color: #8a5a17; }
+.pill.warn b { color: #8a5a17; }
+.pill.ok { border-color: #bcd8c7; background: var(--accent-soft); color: var(--accent); }
+.pill.ok b { color: var(--accent); }
+
+.checkbox-field { margin-top: 4px; }
+.check-line { display: flex; align-items: flex-start; gap: 8px; font-weight: 600; }
+.check-line input[type="checkbox"] { width: 17px; height: 17px; margin-top: 3px; accent-color: var(--accent); }
+.check-line label { font-weight: 600; }
+
+.takeover-panel { border-color: #e0b56a; background: #fffdf6; }
+.takeover-panel.done { border-color: #bcd8c7; background: #f8fcf9; }
+.takeover-panel .upload { margin-top: 14px; }
+.seal-hint { margin: 0 0 0 10px; white-space: nowrap; }
 
 .page {
   width: min(1180px, calc(100% - 32px));

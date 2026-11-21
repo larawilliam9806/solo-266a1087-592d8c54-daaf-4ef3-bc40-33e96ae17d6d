@@ -113,8 +113,23 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/initialize")
     def initialize():
         check_csrf()
-        service.initialize(db_path, request.form.get("month"))
+        service.initialize(
+            db_path,
+            request.form.get("month"),
+            takeover=request.form.get("takeover") in ("1", "on", "true", "yes"),
+        )
         return redirect(url_for("dashboard"))
+
+    @app.post("/api/takeover")
+    def takeover():
+        check_csrf()
+        upload_file = request.files.get("file")
+        if upload_file is None or not upload_file.filename:
+            raise ValidationError("请选择要上传的旧仓接账清册 CSV 文件")
+        result = service.submit_takeover(
+            db_path, upload_file.filename, upload_file.read()
+        )
+        return jsonify({"ok": True, **result})
 
     @app.post("/api/upload")
     def upload():

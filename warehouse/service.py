@@ -56,6 +56,40 @@ def _require_state(conn: sqlite3.Connection) -> sqlite3.Row:
     return row
 
 
+def _takeover_view(conn: sqlite3.Connection, state: sqlite3.Row | None) -> dict:
+    """Takeover block shared by every state response."""
+
+    if state is None or not int(state["takeover_mode"]):
+        return {
+            "mode": False,
+            "status": "none",
+            "first_pending_month": None,
+            "submission": None,
+        }
+    submission = None
+    if state["takeover_id"] is not None:
+        row = conn.execute(
+            "SELECT * FROM takeovers WHERE id = ?", (state["takeover_id"],)
+        ).fetchone()
+        if row is not None:
+            submission = {
+                "id": row["id"],
+                "filename": row["filename"],
+                "submitted_at": row["submitted_at"],
+                "row_count": row["row_count"],
+                "register_only_count": row["register_only_count"],
+                "register_won_count": row["register_won_count"],
+                "new_won_count": row["new_won_count"],
+                "digest": row["digest"],
+            }
+    return {
+        "mode": True,
+        "status": state["takeover_status"],
+        "first_pending_month": state["first_pending_month"],
+        "submission": submission,
+    }
+
+
 def _sealed_months(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT month, seq, sealed_at, total_grams FROM snapshots ORDER BY seq"
@@ -145,6 +179,7 @@ def state_view(db_path: str) -> dict:
                 "current_pending_month": None,
                 "sealed_months": [],
                 "batches": [],
+                "takeover": _takeover_view(conn, state),
             }
         sealed = [
             {
@@ -169,25 +204,30 @@ def state_view(db_path: str) -> dict:
             "updated_at": state["updated_at"],
             "sealed_months": sealed,
             "batches": batches,
+            "takeover": _takeover_view(conn, state),
         }
 
 
-def initialize(db_path: str, month: object) -> dict:
+def initialize(
+    db_path: str, month: object, takeover: bool = False
+) -> dict:
     try:
         first = parse_month(month)
     except InputError as exc:
         raise ValidationError(str(exc)) from None
     stamp = now_iso()
+    takeover_status = "pending" if takeover else "none"
     with write_tx(db_path) as conn:
         if _state_row(conn) is not None:
             raise AlreadyInitializedError("已经选定过首个待封月，不能重复初始化")
         conn.execute(
             """
             INSERT INTO state (id, first_pending_month, current_pending_month,
-                               created_at, updated_at)
-            VALUES (1, ?, ?, ?, ?)
+                               takeover_mode, takeover_status, created_at,
+                               updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
             """,
-            (first, first, stamp, stamp),
+            (first, first, 1 if takeover else 0, takeover_status, stamp, stamp),
         )
     return state_view(db_path)
 
@@ -482,6 +522,416 @@ def _insert_booking(
     )
 
 
+def _insert_takeover_booking(
+    conn: sqlite3.Connection,
+    *,
+    takeover_id: int,
+    ticket_no: str,
+    revision: int,
+    target_month: str,
+    collection_month: str,
+    street: str,
+    grams: int,
+    kind: str,
+    stamp: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO bookings (batch_id, takeover_id, ticket_no, revision,
+                              target_month, collection_month, street, grams,
+                              kind, created_at)
+        VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            takeover_id,
+            ticket_no,
+            revision,
+            target_month,
+            collection_month,
+            street,
+            grams,
+            kind,
+            stamp,
+        ),
+    )
+
+
+# --------------------------------------------------------------- takeover
+
+
+def submit_takeover(db_path: str, filename: str, data: bytes) -> dict:
+    """Apply one old-warehouse settled-ticket register (the "接账清册").
+
+    The register reuses the ordinary five-column CSV.  Every ticket number
+    appears once and its collection month must be strictly earlier than the
+    first pending month.  For ticket numbers already collected in the new
+    warehouse, two conflicts reject the whole register: differing collection
+    months, or identical revision numbers carrying different content.
+
+    On success, all inside one serialised transaction:
+
+    * provisional bookings the new warehouse made before the takeover for any
+      shared ticket number are reversed (ordinary batches themselves stay);
+    * register-only tickets become effective tickets; their effective net is
+      booked (``takeover_book``) and their settled net deducted
+      (``takeover_deduct``) on the register's street, so the two cancel;
+    * shared tickets keep the higher revision; the effective version is booked
+      on its street (``takeover_book``) and the register's settled net deducted
+      on the register's street (``takeover_deduct``);
+    * takeover state, the effective ticket set and the first-month bottom
+      table take effect together.
+
+    Any failure rolls everything back, so a rejected register leaves the
+    ledger exactly as it was and the clerk can simply resubmit.
+    """
+
+    # Cheap precondition check so "not initialised" wins over CSV errors.
+    with read_tx(db_path) as conn:
+        state = _require_state(conn)
+        if not int(state["takeover_mode"]):
+            raise ConflictError("本账套建账时未选择从旧仓接账，不能提交接账清册")
+        if state["takeover_status"] == "done":
+            raise ConflictError("旧仓接账已完成，期初只接一次，不能再次提交清册")
+        first_month = state["first_pending_month"]
+
+    try:
+        rows = parse_upload(data, filename)
+    except InputError as exc:
+        raise ValidationError(str(exc)) from None
+
+    digest = hashlib.sha256(data).hexdigest()
+    stamp = now_iso()
+
+    with write_tx(db_path) as conn:
+        state = _require_state(conn)
+        if not int(state["takeover_mode"]):
+            raise ConflictError("本账套建账时未选择从旧仓接账，不能提交接账清册")
+        if state["takeover_status"] == "done":
+            raise ConflictError("旧仓接账已完成，期初只接一次，不能再次提交清册")
+        first_month = state["first_pending_month"]
+
+        # One row per ticket number inside the register itself.
+        seen: dict[str, int] = {}
+        duplicates: list[dict] = []
+        for row in rows:
+            if row["ticket_no"] in seen:
+                duplicates.append(
+                    {
+                        "line": row["line"],
+                        "ticket_no": row["ticket_no"],
+                        "message": (
+                            f"单号 {row['ticket_no']} 在清册中重复"
+                            f"（首次出现在第 {seen[row['ticket_no']]} 行），"
+                            "每个单号只能填一行"
+                        ),
+                    }
+                )
+            else:
+                seen[row["ticket_no"]] = row["line"]
+        if duplicates:
+            raise BatchRejected("接账清册内单号重复，整份退回", duplicates)
+
+        errors: list[dict] = []
+        for row in rows:
+            if not row["collection_month"] < first_month:
+                errors.append(
+                    {
+                        "line": row["line"],
+                        "ticket_no": row["ticket_no"],
+                        "message": (
+                            f"单号 {row['ticket_no']} 的清运月 "
+                            f"{row['collection_month']} 必须早于首个待封月 "
+                            f"{first_month}"
+                        ),
+                    }
+                )
+        if errors:
+            raise BatchRejected(
+                "接账清册存在清运月不早于首个待封月的单据，整份退回", errors
+            )
+
+        existing: dict[str, sqlite3.Row] = {}
+        ticket_numbers = list(seen)
+        for start in range(0, len(ticket_numbers), 500):
+            chunk = ticket_numbers[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for record in conn.execute(
+                f"SELECT * FROM tickets WHERE ticket_no IN ({placeholders})",
+                chunk,
+            ):
+                existing[record["ticket_no"]] = record
+
+        # Cross-warehouse conflicts: collection month mismatch, or the same
+        # revision number carrying different content.  Every conflicting
+        # ticket number is reported before the whole register is rejected.
+        conflicts: list[dict] = []
+        for row in rows:
+            record = existing.get(row["ticket_no"])
+            if record is None:
+                continue
+            if record["collection_month"] != row["collection_month"]:
+                conflicts.append(
+                    {
+                        "line": row["line"],
+                        "ticket_no": row["ticket_no"],
+                        "message": (
+                            f"单号 {row['ticket_no']} 两仓清运月不符："
+                            f"新仓 {record['collection_month']}，"
+                            f"旧仓清册 {row['collection_month']}"
+                        ),
+                    }
+                )
+                continue
+            if row["revision"] == int(record["current_revision"]) and (
+                row["street"] != record["street"]
+                or row["grams"] != int(record["weight_grams"])
+            ):
+                conflicts.append(
+                    {
+                        "line": row["line"],
+                        "ticket_no": row["ticket_no"],
+                        "message": (
+                            f"单号 {row['ticket_no']} 的修订号 "
+                            f"{row['revision']} 在两仓内容不符"
+                            "（街道或净重不一致）"
+                        ),
+                    }
+                )
+        if conflicts:
+            raise BatchRejected(
+                "接账清册与新仓已收单据存在冲突，整份退回，未写入任何数据",
+                conflicts,
+            )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO takeovers (filename, submitted_at, row_count,
+                                   register_only_count, register_won_count,
+                                   new_won_count, digest)
+            VALUES (?, ?, ?, 0, 0, 0, ?)
+            """,
+            (_safe_filename(filename), stamp, len(rows), digest),
+        )
+        takeover_id = int(cursor.lastrowid)
+
+        register_only_count = 0
+        register_won_count = 0
+        new_won_count = 0
+
+        for row in rows:
+            record = existing.get(row["ticket_no"])
+
+            if record is None:
+                # Register-only ticket: it becomes the effective ticket.
+                conn.execute(
+                    """
+                    INSERT INTO tickets (ticket_no, collection_month,
+                                         current_revision, street,
+                                         weight_grams, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        row["ticket_no"],
+                        row["collection_month"],
+                        row["revision"],
+                        row["street"],
+                        row["grams"],
+                        stamp,
+                        stamp,
+                    ),
+                )
+                # First-month old-month adjustment: count the effective
+                # version's net on its street, then deduct the register's
+                # settled net on that same street.  The two entries cancel, so
+                # the old-warehouse settled ticket is never counted again.
+                _insert_takeover_booking(
+                    conn,
+                    takeover_id=takeover_id,
+                    ticket_no=row["ticket_no"],
+                    revision=row["revision"],
+                    target_month=first_month,
+                    collection_month=row["collection_month"],
+                    street=row["street"],
+                    grams=row["grams"],
+                    kind="takeover_book",
+                    stamp=stamp,
+                )
+                _insert_takeover_booking(
+                    conn,
+                    takeover_id=takeover_id,
+                    ticket_no=row["ticket_no"],
+                    revision=row["revision"],
+                    target_month=first_month,
+                    collection_month=row["collection_month"],
+                    street=row["street"],
+                    grams=-row["grams"],
+                    kind="takeover_deduct",
+                    stamp=stamp,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO takeover_tickets
+                        (ticket_no, takeover_id, collection_month,
+                         register_revision, register_street, register_grams,
+                         effective_revision, effective_source, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'register', ?)
+                    """,
+                    (
+                        row["ticket_no"],
+                        takeover_id,
+                        row["collection_month"],
+                        row["revision"],
+                        row["street"],
+                        row["grams"],
+                        row["revision"],
+                        stamp,
+                    ),
+                )
+                register_only_count += 1
+                continue
+
+            # Shared ticket number.  First undo every provisional booking the
+            # new warehouse had made for it (all land in the first month
+            # before any seal); the booked batch records themselves remain.
+            provisional = conn.execute(
+                "SELECT * FROM bookings WHERE ticket_no = ? ORDER BY id",
+                (row["ticket_no"],),
+            ).fetchall()
+            for booking in provisional:
+                _insert_takeover_booking(
+                    conn,
+                    takeover_id=takeover_id,
+                    ticket_no=booking["ticket_no"],
+                    revision=int(booking["revision"]),
+                    target_month=first_month,
+                    collection_month=booking["collection_month"],
+                    street=booking["street"],
+                    grams=-int(booking["grams"]),
+                    kind="reverse",
+                    stamp=stamp,
+                )
+
+            if row["revision"] >= int(record["current_revision"]):
+                # The register carries the higher (or equal) revision: it is
+                # the effective version.  Equal revisions already proved
+                # identical during conflict checking.
+                if row["revision"] > int(record["current_revision"]):
+                    conn.execute(
+                        """
+                        UPDATE tickets
+                           SET current_revision = ?, street = ?, weight_grams = ?,
+                               updated_at = ?
+                         WHERE ticket_no = ?
+                        """,
+                        (
+                            row["revision"],
+                            row["street"],
+                            row["grams"],
+                            stamp,
+                            row["ticket_no"],
+                        ),
+                    )
+                effective_revision = row["revision"]
+                effective_source = "register"
+                effective_street = row["street"]
+                effective_grams = row["grams"]
+                register_won_count += 1
+            else:
+                # The new warehouse already held a newer revision: it stays
+                # effective and later corrections start from it.
+                effective_revision = int(record["current_revision"])
+                effective_source = "new"
+                effective_street = record["street"]
+                effective_grams = int(record["weight_grams"])
+                new_won_count += 1
+
+            # First-month old-month adjustment: count the effective version's
+            # net on its street, then deduct the register's settled net on the
+            # register's street.  Tickets absent from the register keep their
+            # ordinary provisional booking untouched.
+            _insert_takeover_booking(
+                conn,
+                takeover_id=takeover_id,
+                ticket_no=row["ticket_no"],
+                revision=effective_revision,
+                target_month=first_month,
+                collection_month=row["collection_month"],
+                street=effective_street,
+                grams=effective_grams,
+                kind="takeover_book",
+                stamp=stamp,
+            )
+            _insert_takeover_booking(
+                conn,
+                takeover_id=takeover_id,
+                ticket_no=row["ticket_no"],
+                revision=row["revision"],
+                target_month=first_month,
+                collection_month=row["collection_month"],
+                street=row["street"],
+                grams=-row["grams"],
+                kind="takeover_deduct",
+                stamp=stamp,
+            )
+            conn.execute(
+                """
+                INSERT INTO takeover_tickets
+                    (ticket_no, takeover_id, collection_month,
+                     register_revision, register_street, register_grams,
+                     effective_revision, effective_source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["ticket_no"],
+                    takeover_id,
+                    row["collection_month"],
+                    row["revision"],
+                    row["street"],
+                    row["grams"],
+                    effective_revision,
+                    effective_source,
+                    stamp,
+                ),
+            )
+
+        conn.execute(
+            """
+            UPDATE takeovers
+               SET register_only_count = ?, register_won_count = ?,
+                   new_won_count = ?
+             WHERE id = ?
+            """,
+            (
+                register_only_count,
+                register_won_count,
+                new_won_count,
+                takeover_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE state SET takeover_status = 'done', takeover_id = ?, "
+            "updated_at = ? WHERE id = 1",
+            (takeover_id, stamp),
+        )
+
+        submission = _takeover_view(
+            conn, _state_row(conn)
+        )["submission"]
+        payload = _payload(first_month, None, _table_rows(conn, first_month))
+
+    return {
+        "takeover": submission,
+        "first_pending_month": first_month,
+        "summary": {
+            "rows": len(rows),
+            "register_only": register_only_count,
+            "register_won": register_won_count,
+            "new_won": new_won_count,
+        },
+        "table": payload,
+    }
+
+
 # -------------------------------------------------------------------- seal
 
 
@@ -511,6 +961,16 @@ def seal_month(db_path: str, month: object) -> tuple[dict, bool]:
             )
         if target != pending:
             raise ConflictError(f"{target} 未处于待封状态，无法封存")
+
+        if (
+            target == state["first_pending_month"]
+            and int(state["takeover_mode"])
+            and state["takeover_status"] != "done"
+        ):
+            raise ConflictError(
+                f"首月 {target} 必须等旧仓接账成功后才能封存；"
+                "接账清册尚未通过，请先提交或重交清册"
+            )
 
         payload = _payload(target, stamp, _table_rows(conn, pending))
         seq = conn.execute(
